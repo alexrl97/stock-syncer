@@ -623,7 +623,7 @@ def run(preview=False, force=False):
         summ.append("ℹ️ Verlusttopf aufgebraucht – ab jetzt fällt auf Gewinne Abgeltungsteuer an.")
     lines.append("\n".join(summ))
     msg = "\n\n".join(lines)
-    if orders and not preview:
+    if orders:
         msg += ("\n\nNach <b>jeder Runde /buy</b> schicken – gebucht wird die jeweils offene Runde zu den Kursen "
                 "zum Zeitpunkt deiner Nachricht (<code>/buy alle</code> bucht alles auf einmal). Abweichungen: "
                 "<code>/buy SPYL=16.80 XNAS=88@61.9</code> (Preis bzw. Stück@Preis).")
