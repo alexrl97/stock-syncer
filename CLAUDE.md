@@ -235,4 +235,7 @@ automatisch freitags 20:15 UTC und am Signaltag. **Zwei Handelsrunden** (`SLOTS`
 Runde 1 10:00–11:00, Runde 2 15:45–17:15 Berliner Zeit): Geldmarkt-Verkauf immer Runde 1, Geldmarkt-Kauf
 Runde 2; je ETF entscheidet der Median-Spread der letzten 30 Tage (≥ `SLOT_MIN_SAMPLES` Messungen je Runde),
 sonst `SLOT_DEFAULT` (US-Werte + REIT Runde 2). `trend_orders.slot` speichert die Runde; `/buy` bucht die
-früheste offene Runde, `/buy alle` alles.
+früheste offene Runde, `/buy alle` alles. Ausführungskurs = gettex-Ask (Kauf) / -Bid (Verkauf) aus
+`gettex_spreads` zum Nachrichtenzeitpunkt (Fallback Yahoo). Kein /buy bis 22 Uhr am Handelstag →
+`auto_book_overdue()` bucht die Runde zum Bid/Ask bei Fensterbeginn (Status `auto`). Geldmarkt-Verkäufe
+nur in ganzen Stücken, aufgerundet.

@@ -285,13 +285,16 @@ def book(lots, orders, pot, cash, day):
                 gain += take * (o["price"] - float(new_lots.at[idx, "buy_price"]))
                 new_lots.at[idx, "shares"] = float(new_lots.at[idx, "shares"]) - take
                 left -= take
+            # mehr verkauft als gebucht (z.B. aufgerundeter Geldmarkt) -> nur den Bestand verbuchen
+            o["booked"] = o["shares"] + (left if left > 1e-9 else 0.0)
             o["taxable"] = gain * (1 - tf)
             realized += o["taxable"]
         else:
             o["taxable"] = 0.0
+            o["booked"] = o["shares"]
             new_lots = pd.concat([new_lots, pd.DataFrame([dict(id=None, ticker=o["sym"], isin=o["isin"],
                                   shares=o["shares"], buy_date=day, buy_price=o["price"])])], ignore_index=True)
-        cash -= o["shares"] * o["price"]
+        cash -= o["booked"] * o["price"]
     tax = max(realized - max(pot, 0), 0) * TAX_RATE if realized > 0 else 0.0
     pot -= realized
     cash -= tax
@@ -316,6 +319,24 @@ def price_at(sym, ts):
     return None
 
 
+def fill_price(sym, isin, side, ts, after=False):
+    """Ausfuehrungskurs: gettex-Ask (Kauf) bzw. -Bid (Verkauf) aus trading.gettex_spreads.
+    after=False: letzte Messung bis ts; after=True: erste Messung ab ts (Beginn des Zeitfensters).
+    Fallback ohne Messung (max. 20 Min. entfernt): Yahoo-Kurs."""
+    col = "ask" if side == "BUY" else "bid"
+    cond, order = ("ts >= :t AND ts <= :t + interval '20 minutes'", "ts") if after else \
+                  ("ts <= :t AND ts >= :t - interval '20 minutes'", "ts DESC")
+    try:
+        with engine.connect() as c:
+            v = c.execute(text(f"SELECT {col} FROM trading.gettex_spreads WHERE isin = :i AND {cond} "
+                               f"ORDER BY {order} LIMIT 1"), dict(i=isin, t=ts.to_pydatetime())).scalar()
+        if v:
+            return float(v)
+    except Exception as e:
+        print(f"fill_price {isin}: {e}")
+    return price_at(sym, ts)
+
+
 def parse_overrides(txt):
     """'/buy SPYL=16.80 XNAS=88@61.9' -> {'SPYL.DE': (None, 16.8), 'XNAS.DE': (88, 61.9)}"""
     out = {}
@@ -338,13 +359,15 @@ def parse_overrides(txt):
     return out
 
 
-def apply_pending(fill_time=None, overrides=None, all_slots=True):
+def apply_pending(fill_time=None, overrides=None, all_slots=True, slot=None, window_start=False):
     """Bucht alle offenen Orders. fill_time=None -> zum Signalkurs (Rueckgabe: Anzahl);
     sonst zum Kurs dieses Zeitpunkts (Rueckgabe: (orders, cash, pot) bzw. [] ohne offene Orders)."""
     overrides = overrides or {}
     with engine.connect() as c:
         pend = pd.read_sql(text("SELECT * FROM trading.trend_orders WHERE status = 'pending' ORDER BY id"), c)
-        if not pend.empty and not all_slots:
+        if not pend.empty and slot is not None:
+            pend = pend[pend.slot == slot]
+        elif not pend.empty and not all_slots:
             pend = pend[pend.slot == pend.slot.min()]      # /buy bucht die frueheste offene Runde
         if pend.empty:
             return 0 if fill_time is None else []
@@ -356,7 +379,7 @@ def apply_pending(fill_time=None, overrides=None, all_slots=True):
         n = float(r.shares) * sign
         pr = float(r.price_est)
         if fill_time is not None:
-            live = price_at(r.ticker, fill_time)
+            live = fill_price(r.ticker, r["isin"], r.side, fill_time, after=window_start)
             pr = live if live else pr
         if r.ticker in overrides:
             n_o, pr_o = overrides[r.ticker]
@@ -378,11 +401,34 @@ def apply_pending(fill_time=None, overrides=None, all_slots=True):
         for o in orders:
             c.execute(text("UPDATE trading.trend_orders SET status = :st, exec_shares = :n, exec_price = :p, "
                            "exec_at = :t, taxable_gain_est = :g WHERE id = :id"),
-                      dict(st="executed" if fill_time is not None else "assumed", n=abs(o["shares"]), p=o["price"],
+                      dict(st=("auto" if window_start else "executed") if fill_time is not None else "assumed",
+                           n=abs(o["shares"]), p=o["price"],
                            t=fill_time.to_pydatetime() if fill_time is not None else None, g=o["taxable"], id=o["id"]))
     if fill_time is None:
         return len(orders)
     return orders, cash, pot
+
+
+def auto_book_overdue():
+    """Offene Orders ohne /buy: nach 22 Uhr am Handelstag zum gettex-Bid/Ask bei Beginn des Zeitfensters buchen."""
+    with engine.connect() as c:
+        pend = pd.read_sql(text("SELECT DISTINCT run_date, slot FROM trading.trend_orders WHERE status = 'pending'"), c)
+    now = pd.Timestamp.now(tz="Europe/Berlin")
+    for _, r in pend.sort_values(["run_date", "slot"]).iterrows():
+        day = next_trading_day(r.run_date)
+        if now < pd.Timestamp(f"{day} 22:00", tz="Europe/Berlin"):
+            continue
+        start = pd.Timestamp(f"{day} {SLOTS[int(r.slot)][0]}", tz="Europe/Berlin").tz_convert("UTC")
+        res = apply_pending(fill_time=start, slot=int(r.slot), window_start=True)
+        if res:
+            orders, cash, pot = res
+            ol = [f"🤖 <b>Runde {int(r.slot)} ohne /buy – automatisch gebucht</b> "
+                  f"(Kurs bei Fensterbeginn {day:%d.%m.} {SLOTS[int(r.slot)][0]}, Kauf zum Ask, Verkauf zum Bid)"]
+            for o in orders:
+                ol.append(f"{'🔴' if o['shares'] < 0 else '🟢'} {abs(o['shares']):g} × {o['name']} "
+                          f"à {o['price']:.2f} € = {eur(abs(o['shares']) * o['price'])}")
+            ol.append(f"Konto: {eur(cash)}{' (Kredit)' if cash < 0 else ''} · Verlusttopf: {eur(pot)}")
+            send("\n".join(ol))
 
 
 def status_text():
@@ -450,6 +496,7 @@ def poll_commands():
     if max_id != last:
         with engine.begin() as c:
             c.execute(text("UPDATE trading.trend_bot SET last_update_id = :u WHERE id = 1"), dict(u=max_id))
+    auto_book_overdue()
 
 
 # ---------------------------------------------------------------- Kern
@@ -555,6 +602,8 @@ def run(preview=False, force=False):
     else:
         t_m = 0
     d_m = t_m - cur_m
+    if d_m < 0:
+        d_m = -math.ceil(-d_m - 1e-9)   # Verkauf nur ganze Stuecke, aufgerundet
     if abs(d_m) * pm >= float(acc["min_order_eur"]) or (t_m == 0 and cur_m > 0):
         orders.append(dict(sym=MMF[2], isin=MMF[3], name=MMF[1], shares=d_m, price=pm))
 
@@ -624,14 +673,17 @@ def run(preview=False, force=False):
     lines.append("\n".join(summ))
     msg = "\n\n".join(lines)
     if orders:
-        msg += ("\n\nNach <b>jeder Runde /buy</b> schicken – gebucht wird die jeweils offene Runde zu den Kursen "
-                "zum Zeitpunkt deiner Nachricht (<code>/buy alle</code> bucht alles auf einmal). Abweichungen: "
-                "<code>/buy SPYL=16.80 XNAS=88@61.9</code> (Preis bzw. Stück@Preis).")
-    isins = [o["isin"] for o in orders]
+        msg += ("\n\nNach <b>jeder Runde /buy</b> schicken – gebucht wird die offene Runde zum gettex-Kurs "
+                "zum Zeitpunkt deiner Nachricht (Kauf zum Ask, Verkauf zum Bid). Kommt bis 22 Uhr kein /buy, "
+                "bucht das System die Runde zum Kurs bei Fensterbeginn.")
     print(msg)
     send(msg)
-    if isins:
-        send("📑 <b>Kopierbare ISINs:</b>\n" + "\n".join(f"<code>{i}</code>" for i in isins))
+    for k in (1, 2):
+        grp = [o for o in orders if o.get("slot", 1) == k]
+        if grp:
+            send(f"📑 <b>Runde {k} ({SLOTS[k][0]}–{SLOTS[k][1]}) – kopierbare ISINs:</b>\n" +
+                 "\n".join(f"{'🔴' if o['shares'] < 0 else '🟢'} <code>{o['isin']}</code> {abs(o['shares']):g} Stk"
+                           for o in sorted(grp, key=lambda o: o['shares'] > 0)))
 
     if preview:
         return
