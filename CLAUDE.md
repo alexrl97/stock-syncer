@@ -201,3 +201,24 @@ m.send_telegram_message  = lambda message: print('MSG', message[:60])
 m.fetch_and_send_zertifikate('Nvidia', 0.05, 'NVDA', isin='US67066G1040')
 ```
 Syntax-Check: `python -c "import ast; ast.parse(open('stock_syncer.py', encoding='utf-8').read())"`.
+
+---
+
+## 8. Trendfolge (monatlich) — `trend_allocator.py`
+
+Seit 2026-09 ersetzt die monatliche Trendfolge die ETF-Rebound- und QQQM-3x-Signale
+(beide Aufrufe im `__main__` von `stock_syncer.py` auskommentiert, Code erhalten).
+Die Aktien-Signale (`fetch_and_notify`) laufen unverändert weiter.
+
+- **Regel:** 12 UCITS-ETFs (Liste `CLASSES`), am letzten Xetra-Handelstag: Monatsschluss
+  (ausschüttungsbereinigt) > SMA10 → aktiv. Gewicht je aktiver Klasse `min(1/n_aktiv, cap)`
+  (12,5 %, Quanten 7,5 %) × Hebel. Rest → Geldmarkt-ETF (`MMF`). Ganze Stücke,
+  Rebalancing unter `min_order_eur` wird übersprungen (außer Ein-/Ausstieg).
+- **Hebel:** Wertpapierkredit, nur solange der geschätzte Verlusttopf > 0 ist; begrenzt durch
+  Kreditrahmen und `max_beleihung_auslastung` × Beleihungswert (ETFs 75 %, ETC/REIT 0 %).
+- **State in Neon** (nicht im Repo!): `trading.trend_account` (Konto, Topf, Parameter),
+  `trend_lots` (FIFO-Lots), `trend_runs`, `trend_signals`, `trend_orders`. Das System nimmt
+  Ausführung zum Signal-Schlusskurs an; Abweichungen direkt in den Tabellen korrigieren.
+- **Workflow** `trend.yml`: werktags 17:15/20:15 UTC per Cron, Skript prüft selbst den
+  Monatsletzten und läuft pro Monat einmal. Manuell: `workflow_dispatch` mit `preview`
+  (nur Telegram) oder `force`. Versand über den ETF-Bot.

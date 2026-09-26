@@ -1,0 +1,45 @@
+name: Trendfolge Monatssignal
+
+# Laeuft werktags abends; das Skript prueft selbst, ob heute der letzte Xetra-Handelstag
+# des Monats ist, und laeuft pro Monat nur einmal (trend_runs in Neon).
+# 17:15 UTC = 19:15 MESZ / 18:15 MEZ (Xetra-Schluss 17:30), 20:15 UTC als Nachzuegler.
+on:
+  schedule:
+    - cron: '15 17 * * 1-5'
+    - cron: '15 20 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preview (nur Telegram) oder force (rechnen + speichern)'
+        required: true
+        default: preview
+        type: choice
+        options: [preview, force]
+
+concurrency:
+  group: trend-allocator
+  cancel-in-progress: false
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Trendfolge rechnen
+        env:
+          # PUBLIC Repo: Credentials kommen ausschliesslich aus Secrets
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ETF_TELEGRAM_TOKEN: ${{ secrets.ETF_TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python trend_allocator.py --${{ inputs.mode }}
+          else
+            python trend_allocator.py
+          fi

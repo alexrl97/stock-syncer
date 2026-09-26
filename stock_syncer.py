@@ -1260,5 +1260,7 @@ if __name__ == "__main__":
     time.sleep(30)
     sync_ohlcv_to_neon()
     fetch_and_notify()
-    fetch_etf_signals()
-    fetch_qqqm_growth_signal()
+    # ETF-Rebound- und QQQM-3x-Signale seit 2026-09 deaktiviert (Wechsel auf die
+    # monatliche Trendfolge in trend_allocator.py). Code bleibt fuer spaeter erhalten.
+    # fetch_etf_signals()
+    # fetch_qqqm_growth_signal()
