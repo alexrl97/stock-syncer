@@ -44,13 +44,14 @@ CLASSES = [
     ("US_EQ",   "S&P 500",                        "SPYL.DE", "IE000XZSV718", 0.125, 0.30, 0.75),
     ("INTL_EQ", "Industrieländer ex USA",        "EXUS.DE", "IE0006WW1TQ4", 0.125, 0.30, 0.75),
     ("EM_EQ",   "Schwellenländer",               "IS3N.DE", "IE00BKM4GZ66", 0.125, 0.30, 0.75),
-    ("REIT",    "Immobilien",                     "IQQ6.DE", "IE00B1FZS350", 0.125, 0.30, 0.00),
+    # REIT: Amundi FTSE EPRA Nareit Developed Acc (gettex A4H5, kein Xetra -> Kurse von Euronext Paris)
+    ("REIT",    "Immobilien",                     "EPRA.PA", "LU1437018838", 0.125, 0.00, 0.00),
     ("COMM",    "Rohstoffe",                      "SXRS.DE", "IE00BDFL4P12", 0.125, 0.00, 0.75),
     ("GOLD",    "Gold (ETC)",                     "PPFB.DE", "IE00B4ND3602", 0.125, 0.00, 0.00),
     ("UST_L",   "US-Staatsanl. 20+J EUR-hedged",  "IUSV.DE", "IE00BD8PGZ49", 0.125, 0.00, 0.75),
     ("UST_M",   "US-Staatsanl. 7-10J EUR-hedged", "IBB1.DE", "IE00BGPP6697", 0.125, 0.00, 0.75),
     ("CORP",    "EUR-Unternehmensanleihen",       "D5BG.DE", "LU0478205379", 0.125, 0.00, 0.75),
-    ("BUND",    "Bundesanleihen",                 "X03G.DE", "LU0468896575", 0.125, 0.00, 0.75),
+    ("BUND",    "Bundesanleihen",                 "X03G.DE", "LU0643975161", 0.125, 0.00, 0.75),
     ("QUANT",   "Quanten-Computing",              "QUTM.DE", "IE0007Y8Y157", 0.075, 0.30, 0.75),
     ("NDX",     "Nasdaq-100",                     "XNAS.DE", "IE00BMFKG444", 0.125, 0.30, 0.75),
 ]
@@ -201,14 +202,16 @@ def dividends_since(sym, since, until):
     return float(d.sum())
 
 
-def signals(adj, today):
+def signals(adj, today, warn):
     rows = []
     for key, name, sym, isin, cap, tf, bw in CLASSES:
         s = adj[sym].dropna()
-        # Tagesausreisser (> 25 % gegen Vortag und Folgetag zurueck) ignorieren
+        # Yahoo-Fehlticks: Sprung > 5 %, der am Folgetag zu grossen Teilen zurueckgeht -> ignorieren
         r = s.pct_change()
-        bad = (r.abs() > 0.25) & (r.shift(-1).abs() > 0.2)
+        bad = (r.abs() > 0.05) & (r.shift(-1).abs() > 0.04) & (r * r.shift(-1) < 0)
         s = s[~bad]
+        if abs(r.iloc[-1]) > 0.05:
+            warn.append(f"{sym}: Schlusskurs {r.iloc[-1] * 100:+.1f}% zum Vortag – bitte Kurs prüfen")
         m = s.resample("ME").last().dropna()
         m = m[m.index.date <= pd.Timestamp(today).to_period("M").end_time.date()]
         if len(m) < SMA_MONTHS:
@@ -247,7 +250,8 @@ def run(preview=False, force=False):
             send(msg + " Lauf manuell mit --force wiederholen.")
         return
     price = {s: float(raw[s].dropna().iloc[-1]) for s in raw.columns}
-    sig = signals(adj, today)
+    warn = []
+    sig = signals(adj, today, warn)
 
     cash = float(acc["cash_eur"]); pot = float(acc["verlusttopf_eur"])
     notes = []
@@ -375,6 +379,8 @@ def run(preview=False, force=False):
             f"└ Verlusttopf (geschätzt): {eur(pot)}"]
     if notes:
         summ.append("ℹ️ " + "; ".join(notes))
+    for w_ in warn:
+        summ.append("⚠️ " + w_)
     if pot <= 0 and acc["kredit_aktiv"]:
         summ.append("⚠️ Verlusttopf aufgebraucht → ab nächstem Monat 1x, der Kredit wird abgebaut.")
     lines.append("\n".join(summ))
