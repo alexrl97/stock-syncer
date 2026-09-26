@@ -214,7 +214,7 @@ Die Aktien-Signale (`fetch_and_notify`) laufen unverändert weiter.
   (ausschüttungsbereinigt) > SMA10 → aktiv. Gewicht je aktiver Klasse `min(1/n_aktiv, cap)`
   (12,5 %, Quanten 7,5 %) × Hebel. Rest → Geldmarkt-ETF (`MMF`). Ganze Stücke,
   Rebalancing unter `min_order_eur` wird übersprungen (außer Ein-/Ausstieg).
-- **Hebel:** Wertpapierkredit, nur solange der geschätzte Verlusttopf > 0 ist; begrenzt durch
+- **Hebel:** Wertpapierkredit dauerhaft (Entscheidung 2026-09: lohnt sich auch nach Steuern); begrenzt durch
   Kreditrahmen und `max_beleihung_auslastung` × Beleihungswert (ETFs 75 %, ETC/REIT 0 %).
 - **State in Neon** (nicht im Repo!): `trading.trend_account` (Konto, Topf, Parameter),
   `trend_lots` (FIFO-Lots), `trend_runs`, `trend_signals`, `trend_orders`, `trend_bot`

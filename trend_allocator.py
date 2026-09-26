@@ -5,8 +5,8 @@ Regel (am letzten Xetra-Handelstag des Monats, nach Handelsschluss):
     Monatsschluesse (SMA10)  -> aktiv, sonst inaktiv.
   * Aktive Klassen bekommen je min(1/n_aktiv, Obergrenze) des Eigenkapitals
     (Obergrenze 12,5 %, Quanten 7,5 %), multipliziert mit dem Hebel.
-  * Hebel (Wertpapierkredit) nur solange der geschaetzte Verlusttopf > 0 ist, begrenzt
-    durch den Kreditrahmen und max. 80 % des Beleihungswerts. Danach 1x.
+  * Hebel (Wertpapierkredit) dauerhaft, begrenzt durch den Kreditrahmen und max. 80 % des
+    Beleihungswerts. Abschaltbar ueber trend_account.kredit_aktiv.
   * Rest -> Geldmarkt-ETF. Gehandelt wird am naechsten Handelstag, nur ganze Stuecke.
 
 Der Depotstand (Stuecke, FIFO-Lots, Verrechnungskonto, Verlusttopf) liegt in der
@@ -469,7 +469,7 @@ def run(preview=False, force=False):
     active = [c for c in CLASSES if sig.loc[c[2], "active"]]
     n = len(active)
     w = {c[2]: min(1 / n, c[4]) for c in active} if n else {}
-    lev = float(acc["hebel"]) if (acc["kredit_aktiv"] and pot > 0) else 1.0
+    lev = float(acc["hebel"]) if acc["kredit_aktiv"] else 1.0
     tgt_val = {s: equity * wi * lev for s, wi in w.items()}
     total = sum(tgt_val.values())
     debt = total - equity
@@ -547,8 +547,8 @@ def run(preview=False, force=False):
         summ.append("ℹ️ " + "; ".join(notes))
     for w_ in warn:
         summ.append("⚠️ " + w_)
-    if pot_after <= 0 and acc["kredit_aktiv"]:
-        summ.append("⚠️ Verlusttopf aufgebraucht → ab nächstem Monat 1x, der Kredit wird abgebaut.")
+    if pot_after <= 0 < pot:
+        summ.append("ℹ️ Verlusttopf aufgebraucht – ab jetzt fällt auf Gewinne Abgeltungsteuer an.")
     lines.append("\n".join(summ))
     msg = "\n\n".join(lines)
     if orders and not preview:
