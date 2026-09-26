@@ -60,6 +60,7 @@ ALL = CLASSES + [MMF]
 BY_TICKER = {c[2]: c for c in ALL}
 
 SMA_MONTHS = 10
+WOCHENTAG = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 TAX_RATE = 0.26375          # Abgeltungsteuer + Soli (ohne Kirchensteuer)
 MMF_BUFFER = 0.005          # 0,5 % des EK bleiben als Puffer fuer Kursabweichungen am Handelstag
 
@@ -96,6 +97,13 @@ def is_last_trading_day_of_month(d):
             return False
         n += dt.timedelta(days=1)
     return True
+
+
+def next_trading_day(d):
+    n = d + dt.timedelta(days=1)
+    while not is_trading_day(n):
+        n += dt.timedelta(days=1)
+    return n
 
 
 def today_berlin():
@@ -521,7 +529,9 @@ def run(preview=False, force=False):
     # --- Nachricht
     head = "🔎 <b>VORSCHAU</b> (nicht gespeichert)\n" if preview else ""
     lines = [head + f"📈 <b>Trendfolge – Signal {today:%d.%m.%Y}</b>",
-             "Handeln am nächsten Handelstag, ganze Stücke, Limit ≈ Kurs."]
+             f"🕒 Handeln am <b>{WOCHENTAG[next_trading_day(today).weekday()]} {next_trading_day(today):%d.%m.} zwischen 15:30 und 17:15 Uhr</b>: Xetra und "
+             "US-Börse sind offen → engste Spreads (auch beim Geldmarkt-ETF). Nicht vor 9:30 und nicht nach "
+             "17:30 Uhr handeln. Limit-Order knapp über Ask (Kauf) bzw. unter Bid (Verkauf), ganze Stücke."]
     sl = ["<b>Signale (Kurs vs. SMA10)</b>"]
     for key, name, sym, isin, cap, tf, bw in CLASSES:
         r = sig.loc[sym]
