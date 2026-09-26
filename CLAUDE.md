@@ -231,4 +231,8 @@ Misst im 15-Min-Takt (werktags 06–20 UTC, über `trend.yml`) Bid/Ask aller Tre
 und schreibt sie nach `trading.gettex_spreads`. Quelle: LSEG-Widget-API hinter gettex.de
 (SAML-Request aus der Startseite → Session/JWT → `quote/info` mit `q._BID`/`q._ASK`, Port von
 escalate/gettex-exchange). `--report` = Median-Spread je halbe Stunde (Berliner Zeit) per Telegram,
-automatisch freitags 20:15 UTC. Ziel: das empfohlene Handelsfenster in der Signalnachricht belegen.
+automatisch freitags 20:15 UTC und am Signaltag. **Zwei Handelsrunden** (`SLOTS` in trend_allocator.py:
+Runde 1 10:00–11:00, Runde 2 15:45–17:15 Berliner Zeit): Geldmarkt-Verkauf immer Runde 1, Geldmarkt-Kauf
+Runde 2; je ETF entscheidet der Median-Spread der letzten 30 Tage (≥ `SLOT_MIN_SAMPLES` Messungen je Runde),
+sonst `SLOT_DEFAULT` (US-Werte + REIT Runde 2). `trend_orders.slot` speichert die Runde; `/buy` bucht die
+früheste offene Runde, `/buy alle` alles.

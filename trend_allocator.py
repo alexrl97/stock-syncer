@@ -60,6 +60,12 @@ ALL = CLASSES + [MMF]
 BY_TICKER = {c[2]: c for c in ALL}
 
 SMA_MONTHS = 10
+# Zwei Handelsrunden am Tag nach dem Signal (Berliner Zeit). Runde 1: Xetra laeuft sich ein,
+# Asien/Indien teils noch offen. Runde 2: Xetra UND US-Boerse offen (nach der US-Eroeffnungsphase).
+SLOTS = {1: ("10:00", "11:00"), 2: ("15:45", "17:15")}
+# Startzuordnung, bis genug gettex-Spreaddaten vorliegen (dann entscheidet der Median je Runde).
+SLOT_DEFAULT = {"SPYL.DE": 2, "XNAS.DE": 2, "QUTM.DE": 2, "EPRA.PA": 2}   # Rest: Runde 1
+SLOT_MIN_SAMPLES = 8
 WOCHENTAG = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 TAX_RATE = 0.26375          # Abgeltungsteuer + Soli (ohne Kirchensteuer)
 MMF_BUFFER = 0.005          # 0,5 % des EK bleiben als Puffer fuer Kursabweichungen am Handelstag
@@ -129,6 +135,35 @@ def send(msg):
             print(f"Fehler beim Telegram-Versand: {e}")
 
 
+def slot_spreads():
+    """Median-Spread je ETF in beiden Handelsrunden (letzte 30 Tage) aus trading.gettex_spreads."""
+    q = text("""
+        SELECT ticker, slot, percentile_cont(0.5) WITHIN GROUP (ORDER BY spread_pct) AS med, count(*) AS n
+        FROM (SELECT ticker, spread_pct,
+                     CASE WHEN (ts AT TIME ZONE 'Europe/Berlin')::time BETWEEN CAST(:a1 AS time) AND CAST(:a2 AS time) THEN 1
+                          WHEN (ts AT TIME ZONE 'Europe/Berlin')::time BETWEEN CAST(:b1 AS time) AND CAST(:b2 AS time) THEN 2 END AS slot
+              FROM trading.gettex_spreads
+              WHERE ts > now() - interval '30 days' AND spread_pct IS NOT NULL) x
+        WHERE slot IS NOT NULL GROUP BY ticker, slot""")
+    try:
+        with engine.connect() as c:
+            rows = c.execute(q, dict(a1=SLOTS[1][0], a2=SLOTS[1][1], b1=SLOTS[2][0], b2=SLOTS[2][1])).fetchall()
+    except Exception as e:   # Tabelle existiert evtl. noch nicht
+        print("Spreaddaten nicht verfuegbar:", e)
+        return {}
+    out = {}
+    for t, sl, med, n in rows:
+        out.setdefault(t, {})[int(sl)] = (float(med), int(n))
+    return out
+
+
+def choose_slot(sym, spreads):
+    d = spreads.get(sym, {})
+    if all(k in d and d[k][1] >= SLOT_MIN_SAMPLES for k in (1, 2)):
+        return 1 if d[1][0] <= d[2][0] else 2
+    return SLOT_DEFAULT.get(sym, 1)
+
+
 def eur(x):
     return f"{x:,.0f} €".replace(",", ".")
 
@@ -169,7 +204,8 @@ CREATE TABLE IF NOT EXISTS trading.trend_orders (
     id serial PRIMARY KEY, run_date date, ticker text, isin text, side text,
     shares numeric, price_est numeric, amount_est numeric, taxable_gain_est numeric,
     status text NOT NULL DEFAULT 'pending',       -- pending | executed (/buy) | assumed (ohne /buy)
-    exec_shares numeric, exec_price numeric, exec_at timestamptz
+    exec_shares numeric, exec_price numeric, exec_at timestamptz,
+    slot int NOT NULL DEFAULT 1                  -- Handelsrunde (1 vormittags, 2 nachmittags)
 );
 """
 
@@ -302,12 +338,14 @@ def parse_overrides(txt):
     return out
 
 
-def apply_pending(fill_time=None, overrides=None):
+def apply_pending(fill_time=None, overrides=None, all_slots=True):
     """Bucht alle offenen Orders. fill_time=None -> zum Signalkurs (Rueckgabe: Anzahl);
     sonst zum Kurs dieses Zeitpunkts (Rueckgabe: (orders, cash, pot) bzw. [] ohne offene Orders)."""
     overrides = overrides or {}
     with engine.connect() as c:
         pend = pd.read_sql(text("SELECT * FROM trading.trend_orders WHERE status = 'pending' ORDER BY id"), c)
+        if not pend.empty and not all_slots:
+            pend = pend[pend.slot == pend.slot.min()]      # /buy bucht die frueheste offene Runde
         if pend.empty:
             return 0 if fill_time is None else []
         acc = c.execute(text("SELECT * FROM trading.trend_account WHERE id = 1")).mappings().first()
@@ -393,7 +431,8 @@ def poll_commands():
         ts = pd.Timestamp(m["date"], unit="s", tz="UTC")
         try:
             if cmd == "/buy":
-                res = apply_pending(fill_time=ts, overrides=parse_overrides(txt))
+                everything = any(w.lower() in ("alle", "all") for w in txt.split()[1:])
+                res = apply_pending(fill_time=ts, overrides=parse_overrides(txt), all_slots=everything)
                 if not res:
                     send("ℹ️ Keine offenen Orders – nichts gebucht.")
                     continue
@@ -529,9 +568,9 @@ def run(preview=False, force=False):
     # --- Nachricht
     head = "🔎 <b>VORSCHAU</b> (nicht gespeichert)\n" if preview else ""
     lines = [head + f"📈 <b>Trendfolge – Signal {today:%d.%m.%Y}</b>",
-             f"🕒 Handeln am <b>{WOCHENTAG[next_trading_day(today).weekday()]} {next_trading_day(today):%d.%m.} zwischen 15:30 und 17:15 Uhr</b>: Xetra und "
-             "US-Börse sind offen → engste Spreads (auch beim Geldmarkt-ETF). Nicht vor 9:30 und nicht nach "
-             "17:30 Uhr handeln. Limit-Order knapp über Ask (Kauf) bzw. unter Bid (Verkauf), ganze Stücke."]
+             f"Gehandelt wird am <b>{WOCHENTAG[next_trading_day(today).weekday()]} "
+             f"{next_trading_day(today):%d.%m.}</b> in zwei Runden (siehe unten). Limit-Order knapp über Ask "
+             "(Kauf) bzw. unter Bid (Verkauf), ganze Stücke."]
     sl = ["<b>Signale (Kurs vs. SMA10)</b>"]
     for key, name, sym, isin, cap, tf, bw in CLASSES:
         r = sig.loc[sym]
@@ -539,13 +578,36 @@ def run(preview=False, force=False):
         sl.append(f"{'🟢' if r['active'] else '⚪'} {name}: <code>{dist}</code>")
     lines.append("\n".join(sl))
     if orders:
-        ol = ["<b>Orders</b> (erst verkaufen, dann kaufen)"]
-        for o in sorted(orders, key=lambda o: o["shares"] > 0):
-            side = "🔴 VERKAUF" if o["shares"] < 0 else "🟢 KAUF"
-            ol.append(f"{side} {abs(o['shares']):g} × {o['name']}\n"
-                      f"├ ISIN: <code>{o['isin']}</code>\n"
-                      f"└ ~{o['price']:.2f} € = {eur(abs(o['shares']) * o['price'])}")
-        lines.append("\n".join(ol))
+        spreads = slot_spreads()
+        for o in orders:
+            if o["sym"] == MMF[2]:
+                # Geldmarkt-Verkauf finanziert alles -> Runde 1; ein Geldmarkt-Kauf (Rest) -> zuletzt in Runde 2
+                o["slot"] = 1 if o["shares"] < 0 else 2
+            else:
+                o["slot"] = choose_slot(o["sym"], spreads)
+            sp = spreads.get(o["sym"], {}).get(o["slot"])
+            o["spread"] = sp[0] if sp and sp[1] >= SLOT_MIN_SAMPLES else None
+        for k in (1, 2):
+            grp = [o for o in orders if o["slot"] == k]
+            if not grp:
+                continue
+            # Reihenfolge: Geldmarkt-Verkauf, andere Verkaeufe, Kaeufe, Geldmarkt-Kauf
+            grp.sort(key=lambda o: (0 if (o["sym"] == MMF[2] and o["shares"] < 0) else
+                                    1 if o["shares"] < 0 else 3 if o["sym"] == MMF[2] else 2))
+            ol = [f"{'🕙' if k == 1 else '🕓'} <b>Runde {k}: {SLOTS[k][0]}–{SLOTS[k][1]} Uhr</b>"]
+            for o in grp:
+                side = "🔴 VERKAUF" if o["shares"] < 0 else "🟢 KAUF"
+                amt = abs(o["shares"]) * o["price"]
+                sp = (f" · Spread üblich {o['spread'] * 100:.2f}% ≈ {amt * o['spread'] / 2:.0f} €"
+                      if o["spread"] is not None else "")
+                ol.append(f"{side} {abs(o['shares']):g} × {o['name']}\n"
+                          f"├ ISIN: <code>{o['isin']}</code>\n"
+                          f"└ ~{o['price']:.2f} € = {eur(amt)}{sp}")
+            lines.append("\n".join(ol))
+        if not any(o["spread"] is not None for o in orders):
+            lines.append("ℹ️ Runden-Zuordnung noch nach Voreinstellung (US-Werte + Immobilien in Runde 2). "
+                         "Sobald genug gettex-Spreads gemessen sind, wählt das System je ETF die günstigere Runde. "
+                         "Ist der Spread in der App deutlich größer als üblich: warten, nicht kaufen.")
     else:
         lines.append("<b>Keine Orders</b> – alles bleibt wie es ist.")
     summ = [f"<b>Depot nach den Orders (Schätzung)</b>",
@@ -562,8 +624,9 @@ def run(preview=False, force=False):
     lines.append("\n".join(summ))
     msg = "\n\n".join(lines)
     if orders and not preview:
-        msg += ("\n\nNach dem Kauf <b>/buy</b> schicken – dann buche ich zu den Kursen zum Zeitpunkt deiner "
-                "Nachricht. Abweichungen: <code>/buy SPYL=16.80 XNAS=88@61.9</code> (Preis bzw. Stück@Preis).")
+        msg += ("\n\nNach <b>jeder Runde /buy</b> schicken – gebucht wird die jeweils offene Runde zu den Kursen "
+                "zum Zeitpunkt deiner Nachricht (<code>/buy alle</code> bucht alles auf einmal). Abweichungen: "
+                "<code>/buy SPYL=16.80 XNAS=88@61.9</code> (Preis bzw. Stück@Preis).")
     isins = [o["isin"] for o in orders]
     print(msg)
     send(msg)
@@ -590,9 +653,10 @@ def run(preview=False, force=False):
                            x=None if r["dist"] is None or pd.isna(r["dist"]) else r["dist"], a=bool(r["active"])))
         for o in orders:
             c.execute(text("INSERT INTO trading.trend_orders (run_date, ticker, isin, side, shares, price_est, "
-                           "amount_est, taxable_gain_est, status) VALUES (:d, :t, :i, :s, :n, :p, :a, :g, 'pending')"),
+                           "amount_est, taxable_gain_est, status, slot) VALUES (:d, :t, :i, :s, :n, :p, :a, :g, 'pending', :sl)"),
                       dict(d=today, t=o["sym"], i=o["isin"], s="BUY" if o["shares"] > 0 else "SELL",
-                           n=abs(o["shares"]), p=o["price"], a=abs(o["shares"]) * o["price"], g=o["taxable"]))
+                           n=abs(o["shares"]), p=o["price"], a=abs(o["shares"]) * o["price"], g=o["taxable"],
+                           sl=o.get("slot", 1)))
     print("Gespeichert.")
 
 
