@@ -225,3 +225,10 @@ Die Aktien-Signale (`fetch_and_notify`) laufen unverändert weiter.
 - **Workflow** `trend.yml`: werktags 17:15/20:15 UTC per Cron (Monatssignal, Skript prüft selbst
   den Monatsletzten, einmal pro Monat) und alle 15 Min. 06–21 UTC `--poll` für Bot-Befehle. Manuell: `workflow_dispatch` mit `preview`
   (nur Telegram) oder `force`. Versand über den ETF-Bot.
+
+### gettex-Spreads — `spread_sampler.py`
+Misst im 15-Min-Takt (werktags 06–20 UTC, über `trend.yml`) Bid/Ask aller Trendfolge-ETFs auf gettex
+und schreibt sie nach `trading.gettex_spreads`. Quelle: LSEG-Widget-API hinter gettex.de
+(SAML-Request aus der Startseite → Session/JWT → `quote/info` mit `q._BID`/`q._ASK`, Port von
+escalate/gettex-exchange). `--report` = Median-Spread je halbe Stunde (Berliner Zeit) per Telegram,
+automatisch freitags 20:15 UTC. Ziel: das empfohlene Handelsfenster in der Signalnachricht belegen.

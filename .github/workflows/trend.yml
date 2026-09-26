@@ -4,6 +4,8 @@ name: Trendfolge Monatssignal
 #    selbst, ob heute der letzte Xetra-Handelstag ist, und laeuft pro Monat nur einmal.
 # 2) Telegram-Befehle (/buy, /status): alle 15 Min. werktags 06-21 UTC per getUpdates.
 #    Gebucht wird zum Kurs zum Zeitpunkt der Nachricht, nicht der Verarbeitung.
+#    Im selben Takt misst spread_sampler.py die gettex-Spreads (06-20 UTC = gettex-Handelszeit),
+#    freitags 20:15 UTC kommt der Spread-Bericht per Telegram.
 on:
   schedule:
     - cron: '15 17 * * 1-5'
@@ -16,7 +18,7 @@ on:
         required: true
         default: preview
         type: choice
-        options: [preview, force, poll]
+        options: [preview, force, poll, spreads]
 
 concurrency:
   group: trend-allocator
@@ -40,11 +42,17 @@ jobs:
           ETF_TELEGRAM_TOKEN: ${{ secrets.ETF_TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" = "spreads" ]; then
+            python spread_sampler.py --report
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             python trend_allocator.py --${{ inputs.mode }}
           elif [ "${{ github.event.schedule }}" = "*/15 6-21 * * 1-5" ]; then
             python trend_allocator.py --poll
+            python spread_sampler.py || echo "Spread-Messung fehlgeschlagen"
           else
             python trend_allocator.py --poll
             python trend_allocator.py
+            if [ "${{ github.event.schedule }}" = "15 20 * * 1-5" ] && [ "$(date -u +%u)" = "5" ]; then
+              python spread_sampler.py --report || echo "Spread-Bericht fehlgeschlagen"
+            fi
           fi
