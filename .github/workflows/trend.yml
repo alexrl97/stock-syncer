@@ -5,7 +5,8 @@ name: Trendfolge Monatssignal
 # 2) Telegram-Befehle (/buy, /status): alle 15 Min. werktags 06-21 UTC per getUpdates.
 #    Gebucht wird zum Kurs zum Zeitpunkt der Nachricht, nicht der Verarbeitung.
 #    Im selben Takt misst spread_sampler.py die gettex-Spreads (06-20 UTC = gettex-Handelszeit),
-#    freitags 20:15 UTC kommt der Spread-Bericht per Telegram.
+#    Spread-Bericht per Telegram: freitags 20:15 UTC und am Signaltag mit dem Monatssignal.
+#    Repo ist PUBLIC -> Actions-Minuten auf Standard-Runnern sind kostenlos (zaehlen nicht aufs Kontingent).
 on:
   schedule:
     - cron: '15 17 * * 1-5'
@@ -32,6 +33,7 @@ jobs:
       - uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+          cache: 'pip'
       - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -52,6 +54,9 @@ jobs:
           else
             python trend_allocator.py --poll
             python trend_allocator.py
+            if [ "${{ github.event.schedule }}" = "15 17 * * 1-5" ]; then
+              python spread_sampler.py --signal-day-report || echo "Spread-Bericht fehlgeschlagen"
+            fi
             if [ "${{ github.event.schedule }}" = "15 20 * * 1-5" ] && [ "$(date -u +%u)" = "5" ]; then
               python spread_sampler.py --report || echo "Spread-Bericht fehlgeschlagen"
             fi

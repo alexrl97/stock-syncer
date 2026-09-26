@@ -126,7 +126,13 @@ def report(send_telegram=True):
 
 if __name__ == "__main__":
     import sys
-    if "--report" in sys.argv:
+    if "--signal-day-report" in sys.argv:
+        # am letzten Handelstag des Monats den Spread-Bericht zusammen mit dem Signal schicken
+        import pandas as pd
+        from trend_allocator import is_last_trading_day_of_month
+        if is_last_trading_day_of_month(pd.Timestamp.now(tz="Europe/Berlin").date()):
+            report()
+    elif "--report" in sys.argv:
         report()
     else:
         sample()
