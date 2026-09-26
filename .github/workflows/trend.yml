@@ -1,27 +1,29 @@
 name: Trendfolge Monatssignal
 
-# Laeuft werktags abends; das Skript prueft selbst, ob heute der letzte Xetra-Handelstag
-# des Monats ist, und laeuft pro Monat nur einmal (trend_runs in Neon).
-# 17:15 UTC = 19:15 MESZ / 18:15 MEZ (Xetra-Schluss 17:30), 20:15 UTC als Nachzuegler.
+# 1) Monatssignal: werktags 17:15/20:15 UTC (Xetra-Schluss 17:30 MEZ/MESZ). Das Skript prueft
+#    selbst, ob heute der letzte Xetra-Handelstag ist, und laeuft pro Monat nur einmal.
+# 2) Telegram-Befehle (/buy, /status): alle 15 Min. werktags 06-21 UTC per getUpdates.
+#    Gebucht wird zum Kurs zum Zeitpunkt der Nachricht, nicht der Verarbeitung.
 on:
   schedule:
     - cron: '15 17 * * 1-5'
     - cron: '15 20 * * 1-5'
+    - cron: '*/15 6-21 * * 1-5'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'preview (nur Telegram) oder force (rechnen + speichern)'
+        description: 'preview (nur Telegram), force (rechnen + speichern) oder poll (Befehle)'
         required: true
         default: preview
         type: choice
-        options: [preview, force]
+        options: [preview, force, poll]
 
 concurrency:
   group: trend-allocator
   cancel-in-progress: false
 
 jobs:
-  signal:
+  run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +33,7 @@ jobs:
       - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Trendfolge rechnen
+      - name: Trendfolge
         env:
           # PUBLIC Repo: Credentials kommen ausschliesslich aus Secrets
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -40,6 +42,9 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             python trend_allocator.py --${{ inputs.mode }}
+          elif [ "${{ github.event.schedule }}" = "*/15 6-21 * * 1-5" ]; then
+            python trend_allocator.py --poll
           else
+            python trend_allocator.py --poll
             python trend_allocator.py
           fi

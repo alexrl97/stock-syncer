@@ -217,8 +217,11 @@ Die Aktien-Signale (`fetch_and_notify`) laufen unverändert weiter.
 - **Hebel:** Wertpapierkredit, nur solange der geschätzte Verlusttopf > 0 ist; begrenzt durch
   Kreditrahmen und `max_beleihung_auslastung` × Beleihungswert (ETFs 75 %, ETC/REIT 0 %).
 - **State in Neon** (nicht im Repo!): `trading.trend_account` (Konto, Topf, Parameter),
-  `trend_lots` (FIFO-Lots), `trend_runs`, `trend_signals`, `trend_orders`. Das System nimmt
-  Ausführung zum Signal-Schlusskurs an; Abweichungen direkt in den Tabellen korrigieren.
-- **Workflow** `trend.yml`: werktags 17:15/20:15 UTC per Cron, Skript prüft selbst den
-  Monatsletzten und läuft pro Monat einmal. Manuell: `workflow_dispatch` mit `preview`
+  `trend_lots` (FIFO-Lots), `trend_runs`, `trend_signals`, `trend_orders`, `trend_bot`
+  (getUpdates-Offset). Der Monatslauf speichert Orders als `pending`; gebucht wird erst per
+  Telegram-**/buy** (Kurs zum Nachrichtenzeitpunkt via 15-Min-Kerzen, Overrides
+  `/buy SPYL=16.80 XNAS=88@61.9`). Ohne /buy bucht der nächste Monatslauf sie zum
+  Signalkurs (`assumed`). **/status** zeigt den Depotstand. Nur der eigene Chat darf buchen.
+- **Workflow** `trend.yml`: werktags 17:15/20:15 UTC per Cron (Monatssignal, Skript prüft selbst
+  den Monatsletzten, einmal pro Monat) und alle 15 Min. 06–21 UTC `--poll` für Bot-Befehle. Manuell: `workflow_dispatch` mit `preview`
   (nur Telegram) oder `force`. Versand über den ETF-Bot.

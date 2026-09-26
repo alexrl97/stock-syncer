@@ -159,7 +159,9 @@ CREATE TABLE IF NOT EXISTS trading.trend_signals (
 );
 CREATE TABLE IF NOT EXISTS trading.trend_orders (
     id serial PRIMARY KEY, run_date date, ticker text, isin text, side text,
-    shares numeric, price_est numeric, amount_est numeric, taxable_gain_est numeric
+    shares numeric, price_est numeric, amount_est numeric, taxable_gain_est numeric,
+    status text NOT NULL DEFAULT 'pending',       -- pending | executed (/buy) | assumed (ohne /buy)
+    exec_shares numeric, exec_price numeric, exec_at timestamptz
 );
 """
 
@@ -223,6 +225,186 @@ def signals(adj, today, warn):
     return pd.DataFrame(rows).set_index("sym")
 
 
+# ---------------------------------------------------------------- Buchung
+def book(lots, orders, pot, cash, day):
+    """Bucht Orders FIFO auf die Lots. Setzt o['taxable'] je Order, gibt (lots, pot, cash) zurueck."""
+    new_lots = lots.copy()
+    realized = 0.0
+    for o in orders:
+        tf = BY_TICKER[o["sym"]][5]
+        if o["shares"] < 0:
+            left = -o["shares"]; gain = 0.0
+            for idx in new_lots[new_lots.ticker == o["sym"]].index:
+                if left <= 1e-9:
+                    break
+                take = min(left, float(new_lots.at[idx, "shares"]))
+                gain += take * (o["price"] - float(new_lots.at[idx, "buy_price"]))
+                new_lots.at[idx, "shares"] = float(new_lots.at[idx, "shares"]) - take
+                left -= take
+            o["taxable"] = gain * (1 - tf)
+            realized += o["taxable"]
+        else:
+            o["taxable"] = 0.0
+            new_lots = pd.concat([new_lots, pd.DataFrame([dict(id=None, ticker=o["sym"], isin=o["isin"],
+                                  shares=o["shares"], buy_date=day, buy_price=o["price"])])], ignore_index=True)
+        cash -= o["shares"] * o["price"]
+    tax = max(realized - max(pot, 0), 0) * TAX_RATE if realized > 0 else 0.0
+    pot -= realized
+    cash -= tax
+    return new_lots[new_lots.shares > 1e-9], pot, cash
+
+
+def price_at(sym, ts):
+    """Kurs zum Zeitpunkt ts (UTC): letzte 15-Min-Kerze bis ts, sonst Eroeffnung des Tages / letzter Schluss."""
+    try:
+        h = yf.Ticker(sym).history(period="5d", interval="15m", auto_adjust=False)["Close"].dropna()
+        h.index = h.index.tz_convert("UTC")
+        before = h[h.index <= ts]
+        if not before.empty and before.index[-1].date() == ts.date():
+            return float(before.iloc[-1])
+        same_day = h[h.index.date == ts.date()]
+        if not same_day.empty:
+            return float(same_day.iloc[0])
+        if not before.empty:
+            return float(before.iloc[-1])
+    except Exception as e:
+        print(f"price_at {sym}: {e}")
+    return None
+
+
+def parse_overrides(txt):
+    """'/buy SPYL=16.80 XNAS=88@61.9' -> {'SPYL.DE': (None, 16.8), 'XNAS.DE': (88, 61.9)}"""
+    out = {}
+    short = {c[2].split(".")[0].upper(): c[2] for c in ALL}
+    short.update({c[3]: c[2] for c in ALL})                      # auch per ISIN
+    short.update({"LYX0WM": MMF[2], "A4H5": "EPRA.PA"})
+    for tok in txt.split()[1:]:
+        if "=" not in tok:
+            continue
+        k, v = tok.split("=", 1)
+        sym = short.get(k.strip().upper())
+        if not sym:
+            continue
+        v = v.replace(",", ".")
+        if "@" in v:
+            n, pr = v.split("@", 1)
+            out[sym] = (float(n), float(pr))
+        else:
+            out[sym] = (None, float(v))
+    return out
+
+
+def apply_pending(fill_time=None, overrides=None):
+    """Bucht alle offenen Orders. fill_time=None -> zum Signalkurs (Rueckgabe: Anzahl);
+    sonst zum Kurs dieses Zeitpunkts (Rueckgabe: (orders, cash, pot) bzw. [] ohne offene Orders)."""
+    overrides = overrides or {}
+    with engine.connect() as c:
+        pend = pd.read_sql(text("SELECT * FROM trading.trend_orders WHERE status = 'pending' ORDER BY id"), c)
+        if pend.empty:
+            return 0 if fill_time is None else []
+        acc = c.execute(text("SELECT * FROM trading.trend_account WHERE id = 1")).mappings().first()
+        lots = pd.read_sql(text("SELECT * FROM trading.trend_lots ORDER BY buy_date, id"), c)
+    orders = []
+    for _, r in pend.iterrows():
+        sign = 1 if r.side == "BUY" else -1
+        n = float(r.shares) * sign
+        pr = float(r.price_est)
+        if fill_time is not None:
+            live = price_at(r.ticker, fill_time)
+            pr = live if live else pr
+        if r.ticker in overrides:
+            n_o, pr_o = overrides[r.ticker]
+            pr = pr_o
+            if n_o is not None:
+                n = n_o * sign
+        orders.append(dict(id=int(r.id), sym=r.ticker, isin=r["isin"], name=BY_TICKER[r.ticker][1], shares=n, price=pr))
+    orders.sort(key=lambda o: o["shares"] > 0)      # Verkaeufe zuerst
+    day = fill_time.tz_convert("Europe/Berlin").date() if fill_time is not None else today_berlin()
+    new_lots, pot, cash = book(lots, orders, float(acc["verlusttopf_eur"]), float(acc["cash_eur"]), day)
+    with engine.begin() as c:
+        c.execute(text("DELETE FROM trading.trend_lots"))
+        for _, l in new_lots.iterrows():
+            c.execute(text("INSERT INTO trading.trend_lots (ticker, isin, shares, buy_date, buy_price) "
+                           "VALUES (:t, :i, :s, :d, :p)"),
+                      dict(t=l["ticker"], i=l["isin"], s=float(l["shares"]), d=l["buy_date"], p=float(l["buy_price"])))
+        c.execute(text("UPDATE trading.trend_account SET cash_eur = :c, verlusttopf_eur = :v, updated_at = now() "
+                       "WHERE id = 1"), dict(c=cash, v=pot))
+        for o in orders:
+            c.execute(text("UPDATE trading.trend_orders SET status = :st, exec_shares = :n, exec_price = :p, "
+                           "exec_at = :t, taxable_gain_est = :g WHERE id = :id"),
+                      dict(st="executed" if fill_time is not None else "assumed", n=abs(o["shares"]), p=o["price"],
+                           t=fill_time.to_pydatetime() if fill_time is not None else None, g=o["taxable"], id=o["id"]))
+    if fill_time is None:
+        return len(orders)
+    return orders, cash, pot
+
+
+def status_text():
+    with engine.connect() as c:
+        acc = c.execute(text("SELECT * FROM trading.trend_account WHERE id = 1")).mappings().first()
+        lots = pd.read_sql(text("SELECT ticker, sum(shares) AS shares, sum(shares * buy_price) AS cost "
+                                "FROM trading.trend_lots GROUP BY ticker"), c)
+        npend = c.execute(text("SELECT count(*) FROM trading.trend_orders WHERE status = 'pending'")).scalar()
+    raw = load_prices(period="10d")["raw"]
+    lines = ["📊 <b>Trendfolge – Depotstand (Schätzung)</b>"]
+    total = 0.0
+    for _, l in lots.iterrows():
+        p = float(raw[l.ticker].dropna().iloc[-1]); v = float(l.shares) * p; total += v
+        lines.append(f"• {BY_TICKER[l.ticker][1]}: {float(l.shares):g} Stk ≈ {eur(v)} "
+                     f"(<code>{(v / float(l.cost) - 1) * 100:+.1f}%</code>)")
+    cash = float(acc["cash_eur"])
+    lines += [f"├ Wertpapiere: {eur(total)}",
+              f"├ Konto: {eur(cash)}" + (" (Kredit)" if cash < 0 else ""),
+              f"├ Eigenkapital: {eur(total + cash)}",
+              f"└ Verlusttopf (geschätzt): {eur(float(acc['verlusttopf_eur']))}"]
+    if npend:
+        lines.append(f"⏳ {npend} offene Order(s) – nach dem Kauf /buy schicken.")
+    return "\n".join(lines)
+
+
+def poll_commands():
+    """Liest neue Nachrichten an den ETF-Bot (getUpdates) und verarbeitet /buy und /status."""
+    with engine.begin() as c:
+        c.execute(text("CREATE TABLE IF NOT EXISTS trading.trend_bot (id int PRIMARY KEY DEFAULT 1, "
+                       "last_update_id bigint NOT NULL DEFAULT 0)"))
+        c.execute(text("INSERT INTO trading.trend_bot (id) VALUES (1) ON CONFLICT DO NOTHING"))
+        last = c.execute(text("SELECT last_update_id FROM trading.trend_bot WHERE id = 1")).scalar()
+    r = requests.get(f"https://api.telegram.org/bot{ETF_TELEGRAM_TOKEN}/getUpdates",
+                     params={"offset": last + 1, "timeout": 0}, timeout=20).json()
+    if not r.get("ok"):
+        print("getUpdates-Fehler:", r)
+        return
+    max_id = last
+    for u in r["result"]:
+        max_id = max(max_id, u["update_id"])
+        m = u.get("message") or {}
+        if str(m.get("chat", {}).get("id")) != str(ETF_CHAT_ID):
+            continue   # nur der eigene Chat darf buchen
+        txt = (m.get("text") or "").strip()
+        cmd = txt.split()[0].split("@")[0].lower() if txt else ""
+        ts = pd.Timestamp(m["date"], unit="s", tz="UTC")
+        try:
+            if cmd == "/buy":
+                res = apply_pending(fill_time=ts, overrides=parse_overrides(txt))
+                if not res:
+                    send("ℹ️ Keine offenen Orders – nichts gebucht.")
+                    continue
+                orders, cash, pot = res
+                ol = [f"✅ <b>Gebucht</b> ({ts.tz_convert('Europe/Berlin'):%d.%m. %H:%M})"]
+                for o in orders:
+                    ol.append(f"{'🔴' if o['shares'] < 0 else '🟢'} {abs(o['shares']):g} × {o['name']} "
+                              f"à {o['price']:.2f} € = {eur(abs(o['shares']) * o['price'])}")
+                ol.append(f"Konto: {eur(cash)}{' (Kredit)' if cash < 0 else ''} · Verlusttopf: {eur(pot)}")
+                send("\n".join(ol))
+            elif cmd == "/status":
+                send(status_text())
+        except Exception as e:
+            send(f"⚠️ Fehler bei {cmd}: {e}")
+    if max_id != last:
+        with engine.begin() as c:
+            c.execute(text("UPDATE trading.trend_bot SET last_update_id = :u WHERE id = 1"), dict(u=max_id))
+
+
 # ---------------------------------------------------------------- Kern
 def run(preview=False, force=False):
     today = today_berlin()
@@ -239,6 +421,13 @@ def run(preview=False, force=False):
     if done and not (force or preview):
         print(f"Fuer {today:%m/%Y} gibt es schon einen Lauf ({done}) — nichts zu tun.")
         return
+
+    stale = 0 if preview else apply_pending(fill_time=None)
+    if stale:
+        send(f"⚠️ {stale} Order(s) vom letzten Signal waren ohne /buy – zum Signalkurs gebucht.")
+        with engine.connect() as c:
+            acc = c.execute(text("SELECT * FROM trading.trend_account WHERE id = 1")).mappings().first()
+            lots = pd.read_sql(text("SELECT * FROM trading.trend_lots ORDER BY buy_date, id"), c)
 
     px = load_prices()
     adj, raw = px["adj"], px["raw"]
@@ -322,31 +511,8 @@ def run(preview=False, force=False):
     if abs(d_m) * pm >= float(acc["min_order_eur"]) or (t_m == 0 and cur_m > 0):
         orders.append(dict(sym=MMF[2], isin=MMF[3], name=MMF[1], shares=d_m, price=pm))
 
-    # --- Buchung (FIFO) und steuerpflichtige Gewinne
-    new_lots = lots.copy()
-    realized = 0.0
-    for o in orders:
-        tf = BY_TICKER[o["sym"]][5]
-        if o["shares"] < 0:
-            left = -o["shares"]; gain = 0.0
-            for idx in new_lots[new_lots.ticker == o["sym"]].index:
-                if left <= 1e-9:
-                    break
-                take = min(left, float(new_lots.at[idx, "shares"]))
-                gain += take * (o["price"] - float(new_lots.at[idx, "buy_price"]))
-                new_lots.at[idx, "shares"] = float(new_lots.at[idx, "shares"]) - take
-                left -= take
-            o["taxable"] = gain * (1 - tf)
-            realized += o["taxable"]
-        else:
-            o["taxable"] = 0.0
-            new_lots = pd.concat([new_lots, pd.DataFrame([dict(id=None, ticker=o["sym"], isin=o["isin"],
-                                  shares=o["shares"], buy_date=today, buy_price=o["price"])])], ignore_index=True)
-        cash -= o["shares"] * o["price"]
-    tax = max(realized - max(pot, 0), 0) * TAX_RATE if realized > 0 else 0.0
-    pot -= realized
-    cash -= tax
-    new_lots = new_lots[new_lots.shares > 1e-9]
+    # --- Buchung simulieren (fuer die Vorschau-Zahlen; echt gebucht wird erst bei /buy)
+    new_lots, pot_after, cash_after = book(lots, orders, pot, cash, today)
 
     new_hold = new_lots.groupby("ticker")["shares"].sum().to_dict()
     invested = sum(float(new_hold.get(c[2], 0)) * price[c[2]] for c in CLASSES)
@@ -375,16 +541,19 @@ def run(preview=False, force=False):
     summ = [f"<b>Depot nach den Orders (Schätzung)</b>",
             f"├ Eigenkapital: {eur(equity)}",
             f"├ Investiert: {eur(invested)} ({lev_eff * 100:.0f} % des EK, {n}/12 Klassen aktiv)",
-            f"├ Kredit genutzt: {eur(max(-cash, 0))} von {eur(float(acc['kredit_rahmen_eur']))}",
-            f"└ Verlusttopf (geschätzt): {eur(pot)}"]
+            f"├ Kredit genutzt: {eur(max(-cash_after, 0))} von {eur(float(acc['kredit_rahmen_eur']))}",
+            f"└ Verlusttopf (geschätzt): {eur(pot_after)}"]
     if notes:
         summ.append("ℹ️ " + "; ".join(notes))
     for w_ in warn:
         summ.append("⚠️ " + w_)
-    if pot <= 0 and acc["kredit_aktiv"]:
+    if pot_after <= 0 and acc["kredit_aktiv"]:
         summ.append("⚠️ Verlusttopf aufgebraucht → ab nächstem Monat 1x, der Kredit wird abgebaut.")
     lines.append("\n".join(summ))
     msg = "\n\n".join(lines)
+    if orders and not preview:
+        msg += ("\n\nNach dem Kauf <b>/buy</b> schicken – dann buche ich zu den Kursen zum Zeitpunkt deiner "
+                "Nachricht. Abweichungen: <code>/buy SPYL=16.80 XNAS=88@61.9</code> (Preis bzw. Stück@Preis).")
     isins = [o["isin"] for o in orders]
     print(msg)
     send(msg)
@@ -394,11 +563,7 @@ def run(preview=False, force=False):
     if preview:
         return
     with engine.begin() as c:
-        c.execute(text("DELETE FROM trading.trend_lots"))
-        for _, l in new_lots.iterrows():
-            c.execute(text("INSERT INTO trading.trend_lots (ticker, isin, shares, buy_date, buy_price) "
-                           "VALUES (:t, :i, :s, :d, :p)"),
-                      dict(t=l.ticker, i=l.isin, s=float(l.shares), d=l.buy_date, p=float(l.buy_price)))
+        # nur Zinsen/Ausschuettungen buchen; die Orders selbst bucht erst /buy
         c.execute(text("UPDATE trading.trend_account SET cash_eur = :c, verlusttopf_eur = :v, "
                        "last_booking_date = :d, updated_at = now() WHERE id = 1"),
                   dict(c=cash, v=pot, d=today))
@@ -407,7 +572,7 @@ def run(preview=False, force=False):
                        "invested_eur = EXCLUDED.invested_eur, debt_eur = EXCLUDED.debt_eur, "
                        "leverage = EXCLUDED.leverage, verlusttopf_eur = EXCLUDED.verlusttopf_eur, "
                        "n_active = EXCLUDED.n_active"),
-                  dict(d=today, e=equity, i=invested, db=max(-cash, 0), l=lev_eff, v=pot, n=n))
+                  dict(d=today, e=equity, i=invested, db=max(-cash_after, 0), l=lev_eff, v=pot_after, n=n))
         for sym, r in sig.iterrows():
             c.execute(text("INSERT INTO trading.trend_signals VALUES (:d, :t, :c, :s, :x, :a) "
                            "ON CONFLICT (run_date, ticker) DO NOTHING"),
@@ -415,7 +580,7 @@ def run(preview=False, force=False):
                            x=None if r["dist"] is None or pd.isna(r["dist"]) else r["dist"], a=bool(r["active"])))
         for o in orders:
             c.execute(text("INSERT INTO trading.trend_orders (run_date, ticker, isin, side, shares, price_est, "
-                           "amount_est, taxable_gain_est) VALUES (:d, :t, :i, :s, :n, :p, :a, :g)"),
+                           "amount_est, taxable_gain_est, status) VALUES (:d, :t, :i, :s, :n, :p, :a, :g, 'pending')"),
                       dict(d=today, t=o["sym"], i=o["isin"], s="BUY" if o["shares"] > 0 else "SELL",
                            n=abs(o["shares"]), p=o["price"], a=abs(o["shares"]) * o["price"], g=o["taxable"]))
     print("Gespeichert.")
@@ -426,11 +591,14 @@ if __name__ == "__main__":
     ap.add_argument("--preview", action="store_true")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--init", action="store_true")
+    ap.add_argument("--poll", action="store_true", help="Telegram-Befehle (/buy, /status) verarbeiten")
     ap.add_argument("--mmf-value", type=float)
     ap.add_argument("--mmf-shares", type=float)
     ap.add_argument("--verlusttopf", type=float, default=6000)
     a = ap.parse_args()
     if a.init:
         init(a.mmf_value, a.verlusttopf, a.mmf_shares)
+    elif a.poll:
+        poll_commands()
     else:
         run(preview=a.preview, force=a.force)
