@@ -164,6 +164,16 @@ def choose_slot(sym, spreads):
     return SLOT_DEFAULT.get(sym, 1)
 
 
+COMMANDS_HELP = (
+    "<b>Befehle</b> (Antwort binnen ~15 Min., werktags 8–23 Uhr)\n"
+    "• <b>/buy</b> – nach einer Runde schicken: bucht die offene Runde zum gettex-Kurs deiner Nachricht "
+    "(Kauf zum Ask, Verkauf zum Bid). Ohne /buy bis 22 Uhr bucht das System zum Kurs bei Fensterbeginn.\n"
+    "• <b>/buy alle</b> – beide Runden auf einmal buchen\n"
+    "• <b>/buy SPYL=16.80 XNAS=88@61.9</b> – nur falls nötig: eigener Preis bzw. Stück@Preis\n"
+    "• <b>/status</b> – Depotstand, Konto/Kredit, Verlusttopf, offene Orders\n"
+    "• <b>/einzahlung 500</b> / <b>/auszahlung 500</b> – Geldbewegung buchen, investiert wird beim nächsten Signal")
+
+
 def eur(x):
     return f"{x:,.0f} €".replace(",", ".")
 
@@ -685,10 +695,7 @@ def run(preview=False, force=False):
         summ.append("ℹ️ Verlusttopf aufgebraucht – ab jetzt fällt auf Gewinne Abgeltungsteuer an.")
     lines.append("\n".join(summ))
     msg = "\n\n".join(lines)
-    if orders:
-        msg += ("\n\nNach <b>jeder Runde /buy</b> schicken – gebucht wird die offene Runde zum gettex-Kurs "
-                "zum Zeitpunkt deiner Nachricht (Kauf zum Ask, Verkauf zum Bid). Kommt bis 22 Uhr kein /buy, "
-                "bucht das System die Runde zum Kurs bei Fensterbeginn.")
+    msg += "\n\n" + COMMANDS_HELP
     print(msg)
     send(msg)
     for k in (1, 2):
