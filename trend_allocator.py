@@ -491,6 +491,19 @@ def poll_commands():
                 send("\n".join(ol))
             elif cmd == "/status":
                 send(status_text())
+            elif cmd in ("/einzahlung", "/auszahlung"):
+                parts = txt.split()
+                amt = float(parts[1].replace(".", "").replace(",", ".")) if len(parts) > 1 else 0.0
+                if amt <= 0:
+                    send(f"ℹ️ Betrag fehlt, z.B. <code>{cmd} 500</code>")
+                    continue
+                if cmd == "/auszahlung":
+                    amt = -amt
+                with engine.begin() as c:
+                    cash = c.execute(text("UPDATE trading.trend_account SET cash_eur = cash_eur + :a, updated_at = now() "
+                                          "WHERE id = 1 RETURNING cash_eur"), dict(a=amt)).scalar()
+                send(f"✅ {'Einzahlung' if amt > 0 else 'Auszahlung'} {eur(abs(amt))} gebucht · Konto: {eur(float(cash))}. "
+                     "Investiert wird mit dem nächsten Monatssignal (bis dahin im Konto bzw. Geldmarkt).")
         except Exception as e:
             send(f"⚠️ Fehler bei {cmd}: {e}")
     if max_id != last:
