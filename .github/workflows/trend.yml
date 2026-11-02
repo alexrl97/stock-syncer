@@ -1,7 +1,9 @@
 name: Trendfolge Monatssignal
 
-# 1) Monatssignal: werktags 17:15/20:15 UTC (Xetra-Schluss 17:30 MEZ/MESZ). Das Skript prueft
-#    selbst, ob heute der letzte Xetra-Handelstag ist, und laeuft pro Monat nur einmal.
+# 1) Monatssignal: jeder geplante Lauf ruft trend_allocator.py auf; das Skript prueft selbst, ob ein
+#    Signal faellig ist (Monatsletzter nach 17:40 Berlin, sonst Nachholen in den ersten 3 Handelstagen
+#    des Folgemonats) und laeuft pro Monat nur einmal. Grund: GitHub hat am 30.10.26 den 17:15-Cron
+#    verschluckt, der 20:15-Lauf scheiterte -> kein Signal.
 # 2) Telegram-Befehle (/buy, /status): alle 15 Min. werktags 06-21 UTC per getUpdates.
 #    Gebucht wird zum Kurs zum Zeitpunkt der Nachricht, nicht der Verarbeitung.
 #    Im selben Takt misst spread_sampler.py die gettex-Spreads (06-20 UTC = gettex-Handelszeit),
@@ -51,6 +53,7 @@ jobs:
           elif [ "${{ github.event.schedule }}" = "*/15 6-21 * * 1-5" ]; then
             python trend_allocator.py --poll
             python spread_sampler.py || echo "Spread-Messung fehlgeschlagen"
+            python trend_allocator.py
           else
             python trend_allocator.py --poll
             python trend_allocator.py

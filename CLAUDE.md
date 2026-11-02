@@ -222,8 +222,11 @@ Die Aktien-Signale (`fetch_and_notify`) laufen unverändert weiter.
   Telegram-**/buy** (Kurs zum Nachrichtenzeitpunkt via 15-Min-Kerzen, Overrides
   `/buy SPYL=16.80 XNAS=88@61.9`). Ohne /buy bucht der nächste Monatslauf sie zum
   Signalkurs (`assumed`). **/status** zeigt den Depotstand, **/einzahlung 500** / **/auszahlung 500** buchen Geld aufs Konto (investiert beim nächsten Signal). Nur der eigene Chat darf buchen.
-- **Workflow** `trend.yml`: werktags 17:15/20:15 UTC per Cron (Monatssignal, Skript prüft selbst
-  den Monatsletzten, einmal pro Monat) und alle 15 Min. 06–21 UTC `--poll` für Bot-Befehle. Manuell: `workflow_dispatch` mit `preview`
+- **Workflow** `trend.yml`: jeder geplante Lauf (17:15/20:15 UTC und alle 15 Min.) ruft das Signal auf;
+  das Skript prüft selbst (`signal_day`): Monatsletzter ab 17:40 Berlin, sonst Nachholen des Vormonats in
+  den ersten 3 Handelstagen (Kurse bis Monatsschluss, Handelstag in `trend_orders.trade_date`), einmal pro
+  Monat. Grund: am 30.10.26 verschluckte GitHub den 17:15-Cron und der 20:15-Lauf scheiterte am
+  yfinance-Sammeldownload ('database is locked') -> Kurse jetzt einzeln mit Retries und alle 15 Min. 06–21 UTC `--poll` für Bot-Befehle. Manuell: `workflow_dispatch` mit `preview`
   (nur Telegram) oder `force`. Versand über den ETF-Bot.
 
 ### gettex-Spreads — `spread_sampler.py`

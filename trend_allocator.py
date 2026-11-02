@@ -217,6 +217,7 @@ CREATE TABLE IF NOT EXISTS trading.trend_orders (
     exec_shares numeric, exec_price numeric, exec_at timestamptz,
     slot int NOT NULL DEFAULT 1                  -- Handelsrunde (1 vormittags, 2 nachmittags)
 );
+ALTER TABLE trading.trend_orders ADD COLUMN IF NOT EXISTS trade_date date;   -- Handelstag (Nachhol-Laeufe)
 """
 
 
@@ -239,11 +240,28 @@ def init(mmf_value, verlusttopf, mmf_shares=None):
 
 
 # ---------------------------------------------------------------- Kurse
-def load_prices(period="2y"):
+def load_prices(period="2y", tries=4):
+    """Einzeln und nacheinander laden: der Sammel-Download mit Threads scheiterte am 30.10.26 an
+    'database is locked' (yfinance-Cache) -> IS3N fehlte -> Absturz, kein Signal."""
+    import time
     syms = [c[2] for c in ALL]
-    adj = yf.download(syms, period=period, interval="1d", auto_adjust=True, progress=False)["Close"]
-    raw = yf.download(syms, period=period, interval="1d", auto_adjust=False, progress=False)["Close"]
-    return {"adj": adj, "raw": raw}
+    adj, raw = {}, {}
+    for k in range(tries):
+        for s in [s for s in syms if s not in raw]:
+            try:
+                df = yf.download(s, period=period, interval="1d", auto_adjust=False, progress=False, threads=False)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                if df.empty or df["Close"].dropna().empty:
+                    continue
+                adj[s], raw[s] = df["Adj Close"], df["Close"]
+            except Exception as e:
+                print(f"{s}: Download fehlgeschlagen ({e})")
+        if len(raw) == len(syms):
+            break
+        time.sleep(5 * (k + 1))
+    missing = [s for s in syms if s not in raw]
+    return {"adj": pd.DataFrame(adj), "raw": pd.DataFrame(raw), "missing": missing}
 
 
 def dividends_since(sym, since, until):
@@ -263,6 +281,9 @@ def signals(adj, today, warn):
     for key, name, sym, isin, cap, tf, bw in CLASSES:
         s = adj[sym].dropna()
         # Yahoo-Fehlticks: Sprung > 5 %, der am Folgetag zu grossen Teilen zurueckgeht -> ignorieren
+        if len(s) < 2:
+            rows.append(dict(sym=sym, close=None, sma=None, dist=None, active=False, note="keine Kurse"))
+            continue
         r = s.pct_change()
         bad = (r.abs() > 0.05) & (r.shift(-1).abs() > 0.04) & (r * r.shift(-1) < 0)
         s = s[~bad]
@@ -422,10 +443,11 @@ def apply_pending(fill_time=None, overrides=None, all_slots=True, slot=None, win
 def auto_book_overdue():
     """Offene Orders ohne /buy: nach 22 Uhr am Handelstag zum gettex-Bid/Ask bei Beginn des Zeitfensters buchen."""
     with engine.connect() as c:
-        pend = pd.read_sql(text("SELECT DISTINCT run_date, slot FROM trading.trend_orders WHERE status = 'pending'"), c)
+        pend = pd.read_sql(text("SELECT DISTINCT run_date, trade_date, slot FROM trading.trend_orders "
+                                "WHERE status = 'pending'"), c)
     now = pd.Timestamp.now(tz="Europe/Berlin")
     for _, r in pend.sort_values(["run_date", "slot"]).iterrows():
-        day = next_trading_day(r.run_date)
+        day = r.trade_date if pd.notna(r.trade_date) else next_trading_day(r.run_date)
         if now < pd.Timestamp(f"{day} 22:00", tz="Europe/Berlin"):
             continue
         start = pd.Timestamp(f"{day} {SLOTS[int(r.slot)][0]}", tz="Europe/Berlin").tz_convert("UTC")
@@ -523,11 +545,46 @@ def poll_commands():
 
 
 # ---------------------------------------------------------------- Kern
+CATCHUP_TRADING_DAYS = 3   # verpasstes Monatssignal so viele Handelstage lang nachholen
+
+
+def signal_day(now):
+    """Signaltag, fuer den jetzt ein Lauf faellig sein kann: heute nach Xetra-Schluss am Monatsletzten,
+    sonst in den ersten Handelstagen des Folgemonats der Vormonats-Letzte (Nachholen, falls GitHub
+    den Cron verschluckt oder der Lauf scheitert). Ob es den Lauf schon gibt, prueft run()."""
+    today = now.date()
+    if is_last_trading_day_of_month(today):
+        return today if now.time() >= dt.time(17, 40) else None
+    d = today.replace(day=1)
+    k = 0
+    while d <= today:
+        k += is_trading_day(d)
+        d += dt.timedelta(days=1)
+    if not is_trading_day(today) or k > CATCHUP_TRADING_DAYS:
+        return None
+    p = today.replace(day=1) - dt.timedelta(days=1)
+    while not is_trading_day(p):
+        p -= dt.timedelta(days=1)
+    return p
+
+
+def trade_day_for(sig_day, now):
+    """Handelstag: der Tag nach dem Signal; beim Nachholen der naechste Tag, an dem Runde 1 noch ganz vor uns liegt."""
+    d = next_trading_day(sig_day)
+    if d < now.date() or (d == now.date() and now.time() >= dt.time.fromisoformat(SLOTS[1][0])):
+        d = now.date() if is_trading_day(now.date()) and now.time() < dt.time.fromisoformat(SLOTS[1][0]) \
+            else next_trading_day(now.date())
+    return d
+
+
 def run(preview=False, force=False):
-    today = today_berlin()
-    if not (force or preview) and not is_last_trading_day_of_month(today):
-        print(f"{today}: nicht der letzte Xetra-Handelstag des Monats — nichts zu tun.")
+    now = pd.Timestamp.now(tz="Europe/Berlin")
+    today = now.date() if (force or preview) else signal_day(now)
+    if today is None:
+        print(f"{now:%Y-%m-%d %H:%M}: kein Monatssignal fällig — nichts zu tun.")
         return
+    catchup = today != now.date()
+    trade_day = trade_day_for(today, now)
     with engine.connect() as c:
         acc = c.execute(text("SELECT * FROM trading.trend_account WHERE id = 1")).mappings().first()
         if acc is None:
@@ -547,12 +604,20 @@ def run(preview=False, force=False):
             lots = pd.read_sql(text("SELECT * FROM trading.trend_lots ORDER BY buy_date, id"), c)
 
     px = load_prices()
-    adj, raw = px["adj"], px["raw"]
+    if px["missing"]:
+        msg = f"⚠️ Trendfolge: keine Yahoo-Kurse für {', '.join(px['missing'])} – Signal folgt beim nächsten Versuch."
+        print(msg)
+        if now.hour >= 21 or catchup:   # tagsueber laeuft alle 15 Min. ein neuer Versuch
+            send(msg)
+        return
+    # beim Nachholen nur Kurse bis zum Signaltag (Monatsschluss) verwenden
+    adj = px["adj"][px["adj"].index.date <= today]
+    raw = px["raw"][px["raw"].index.date <= today]
     last_bar = raw.dropna(how="all").index[-1].date()
     if last_bar != today and not (force or preview):
         msg = f"⚠️ Trendfolge: Yahoo hat noch keinen Schlusskurs für {today} (letzter: {last_bar})."
         print(msg)
-        if pd.Timestamp.now(tz="UTC").hour >= 20:   # letzter Versuch des Tages -> melden
+        if catchup:
             send(msg + " Lauf manuell mit --force wiederholen.")
         return
     price = {s: float(raw[s].dropna().iloc[-1]) for s in raw.columns}
@@ -640,9 +705,11 @@ def run(preview=False, force=False):
     # --- Nachricht
     head = "🔎 <b>VORSCHAU</b> (nicht gespeichert)\n" if preview else ""
     lines = [head + f"📈 <b>Trendfolge – Signal {today:%d.%m.%Y}</b>",
-             f"Gehandelt wird am <b>{WOCHENTAG[next_trading_day(today).weekday()]} "
-             f"{next_trading_day(today):%d.%m.}</b> in zwei Runden (siehe unten). Limit-Order knapp über Ask "
+             f"Gehandelt wird am <b>{WOCHENTAG[trade_day.weekday()]} "
+             f"{trade_day:%d.%m.}</b> in zwei Runden (siehe unten). Limit-Order knapp über Ask "
              "(Kauf) bzw. unter Bid (Verkauf), ganze Stücke."]
+    if catchup:
+        lines[0] += " <i>(nachgeholt, Schlusskurse vom Signaltag)</i>"
     sl = ["<b>Signale (Kurs vs. SMA10)</b>"]
     for key, name, sym, isin, cap, tf, bw in CLASSES:
         r = sig.loc[sym]
@@ -725,10 +792,11 @@ def run(preview=False, force=False):
                            x=None if r["dist"] is None or pd.isna(r["dist"]) else r["dist"], a=bool(r["active"])))
         for o in orders:
             c.execute(text("INSERT INTO trading.trend_orders (run_date, ticker, isin, side, shares, price_est, "
-                           "amount_est, taxable_gain_est, status, slot) VALUES (:d, :t, :i, :s, :n, :p, :a, :g, 'pending', :sl)"),
+                           "amount_est, taxable_gain_est, status, slot, trade_date) "
+                           "VALUES (:d, :t, :i, :s, :n, :p, :a, :g, 'pending', :sl, :td)"),
                       dict(d=today, t=o["sym"], i=o["isin"], s="BUY" if o["shares"] > 0 else "SELL",
                            n=abs(o["shares"]), p=o["price"], a=abs(o["shares"]) * o["price"], g=o["taxable"],
-                           sl=o.get("slot", 1)))
+                           sl=o.get("slot", 1), td=trade_day))
     print("Gespeichert.")
 
 
