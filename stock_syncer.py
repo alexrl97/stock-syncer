@@ -846,16 +846,8 @@ WHERE ticker != ALL(:held_tickers)
             isin_msg = "📑 <b>Kopierbare ISINs:</b>\n" + "\n".join([f"<code>{i}</code>" for i in isins_to_send])
             send_telegram_message(isin_msg)
 
-        # Pro Signal Long-KO-Zertifikate suchen und als Text-Datei senden.
-        # stop_loss_pct ist die TSL des Basiswerts als Dezimalwert (z.B. 0.05 = 5 %).
-        for _, row in df.iterrows():
-            ticker_clean = row['ticker'].split('.')[0]
-            fetch_and_send_zertifikate(
-                basiswert_name=row['name'],
-                tsl_pct=float(row['stop_loss_pct']),
-                ticker_clean=ticker_clean,
-                isin=row['isin'],
-            )
+        # Zertifikate-Suche (Long-KO) pro Signal abgeschaltet (2026-11): finanzen.net-Suche
+        # funktioniert nicht mehr, Hebel wird nicht genutzt. Code (fetch_and_send_zertifikate) bleibt erhalten.
 
         print(f"Erfolg: {len(df)} Signale gesendet.")
 

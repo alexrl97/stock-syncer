@@ -129,6 +129,9 @@ Index, **WKN**, Preis, Entry-% und TSL-%. Danach die WKNs als kopierbare Liste.
 
 ## 5. Zertifikate-Suche (Long-Knock-Outs) — pro Aktien-Signal
 
+> **Seit 2026-11 abgeschaltet:** Der Aufruf in `fetch_and_notify()` ist entfernt (Suche
+> funktionierte nicht mehr, Hebel wird nicht genutzt). Der Code unten ist erhalten.
+
 Python-Port von `gettex_search.js`. Wird in `fetch_and_notify()` **pro Signal**
 aufgerufen und schickt die 5 Long-KO-Calls (mit SL-Funktion) mit dem niedrigsten
 prozentualen Spread als **Textdatei** (`send_telegram_document`, Telegram `sendDocument`).
